@@ -1,18 +1,81 @@
 // data.js
 // -----------------------------------------------------------------------
-// Roster data for the prototype. 8 teams to start (per Owen's call) so we
-// can nail the game loop before scaling to all 32.
+// Two pools live here:
+//   TEAMS         -- full real rosters (QB + RB + 3 WR + TE + 3 impact
+//                     defenders). Used for the QB draft screen AND as
+//                     opponents every week -- opponents stay at full
+//                     strength, which is what makes you the underdog.
+//   FREE_AGENTS   -- the pool packs pull real named players from, split
+//                     into elite / solid / depth tiers.
+//   createDefaultRoster -- builds YOUR starting roster: your drafted QB
+//                     plus a wall of 60-overall "Default" placeholders.
+//                     You build a real team by winning/losing packs.
 //
-// TO EXTEND LATER: this is the same shape you'd get out of a Sleeper-API
-// pull like generate-data.js in Build-A-Player -- add more team objects in
-// the same format and everything else (chemistry, engine, packs, UI) just
-// works, no changes needed elsewhere.
+// TO EXTEND LATER: add more TEAMS entries in the same shape to scale
+// toward all 32; add more FREE_AGENTS entries to deepen the pack pool.
+// Nothing else needs to change.
 //
 // TAGS reference (used by chemistry.js):
 //   QB tags:  rushing, deep_ball, quick_game, rpo, pocket_passer, play_action
 //   Skill tags: pure_rusher, receiving_back, deep_threat, possession, slot
-//   Defense tags: pass_rush, coverage, run_stopper
+//   Defense tags (map to a unit): pass_rush -> DL, coverage -> Secondary,
+//     run_stopper -> LB
 // -----------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
+// Your Week 1 roster is intentionally bad -- your QB is the only real
+// player. Everyone else is a 60-overall placeholder with no tags, so
+// chemistry only kicks in once you've earned real players through packs.
+// -----------------------------------------------------------------------
+export function createDefaultRoster(qb) {
+  return {
+    qb,
+    rb: { name: "Default RB", pos: "RB", overall: 60, tags: [] },
+    wrs: [
+      { name: "Default WR1", pos: "WR", overall: 60, tags: [] },
+      { name: "Default WR2", pos: "WR", overall: 60, tags: [] },
+      { name: "Default WR3", pos: "WR", overall: 60, tags: [] },
+    ],
+    te: { name: "Default TE", pos: "TE", overall: 60, tags: [] },
+    units: { OL: 60, DL: 60, LB: 60, Secondary: 60, ST: 60 },
+    defensePlayers: [], // impact defenders acquired via packs, grouped into units
+  };
+}
+
+// -----------------------------------------------------------------------
+// Free-agent pool that packs draw named players from. Three tiers:
+//   elite  (90-99) -> Star Rentals, streak packs
+//   solid  (80-89) -> season-long win-pack players, temporary loss-pack players
+//   depth  (65-79) -> season-long loss-pack players
+// Mix of offense (RB/WR/TE) and defense (EDGE/CB/LB) -- defensive picks
+// join a specific unit (see chemistry.js TAG_TO_UNIT) rather than a slot.
+// -----------------------------------------------------------------------
+export const FREE_AGENTS = {
+  elite: [
+    { name: "Ja'Marr Chase", pos: "WR", overall: 98, tags: ["deep_threat"] },
+    { name: "Saquon Barkley", pos: "RB", overall: 97, tags: ["pure_rusher"] },
+    { name: "George Kittle", pos: "TE", overall: 91, tags: ["possession"] },
+    { name: "Myles Garrett", pos: "EDGE", overall: 97, tags: ["pass_rush"] },
+    { name: "Sauce Gardner", pos: "CB", overall: 93, tags: ["coverage"] },
+    { name: "Micah Parsons", pos: "LB", overall: 96, tags: ["run_stopper"] },
+  ],
+  solid: [
+    { name: "Rico Dowdle", pos: "RB", overall: 82, tags: ["pure_rusher"] },
+    { name: "Courtland Sutton", pos: "WR", overall: 83, tags: ["possession"] },
+    { name: "Evan Engram", pos: "TE", overall: 82, tags: ["possession"] },
+    { name: "Josh Hines-Allen", pos: "EDGE", overall: 85, tags: ["pass_rush"] },
+    { name: "Jaire Alexander", pos: "CB", overall: 84, tags: ["coverage"] },
+    { name: "Bobby Wagner", pos: "LB", overall: 83, tags: ["run_stopper"] },
+  ],
+  depth: [
+    { name: "Tyler Badie", pos: "RB", overall: 70, tags: ["receiving_back"] },
+    { name: "Tutu Atwell", pos: "WR", overall: 72, tags: ["slot"] },
+    { name: "Durham Smythe", pos: "TE", overall: 68, tags: ["possession"] },
+    { name: "Jonathan Bullard", pos: "EDGE", overall: 71, tags: ["pass_rush"] },
+    { name: "Kindle Vildor", pos: "CB", overall: 69, tags: ["coverage"] },
+    { name: "Kwon Alexander", pos: "LB", overall: 70, tags: ["run_stopper"] },
+  ],
+};
 
 export const TEAMS = [
   {

@@ -2,47 +2,94 @@
 // -----------------------------------------------------------------------
 // The actual game logic, kept separate from the UI on purpose. render()
 // functions in script.js should never need to know HOW a result was
-// calculated, just what the result object looks like. That split is what
-// lets us swap the "simple ticker" for a fancier field animation later
-// without touching this file at all.
+// calculated, just what the result object looks like.
+//
+// Two different "shapes" pass through here:
+//   - a user ROSTER (from data.js createDefaultRoster): has .units and
+//     .defensePlayers, gets upgraded via packs.
+//   - a real opponent TEAM (from data.js TEAMS): has a fixed .defense
+//     array of tagged impact players, no .units.
+// The helpers below normalize both into the same profile shape so
+// strength/grading math doesn't need to branch everywhere.
 // -----------------------------------------------------------------------
+import { TAG_TO_UNIT } from "./chemistry.js";
 
-// Weighted overall for a full team -- this is the core "how good are you" number.
-export function teamStrength(team, boosts = []) {
-  const wrAvg = team.wrs.reduce((s, p) => s + p.overall, 0) / team.wrs.length;
-  const defAvg = team.defense.reduce((s, p) => s + p.overall, 0) / team.defense.length;
+// Real NFL rosters have a full O-line/special teams unit we don't model
+// individually -- assume competent-starter level so opponents aren't
+// artificially weak in areas we didn't bother simulating.
+const OPPONENT_OL = 78;
+const OPPONENT_ST = 72;
 
-  let strength =
-    team.qb.overall * 0.30 +
-    team.rb.overall * 0.15 +
-    wrAvg * 0.25 +
-    team.te.overall * 0.10 +
-    defAvg * 0.20;
+function avgOr(list, fallback) {
+  if (!list.length) return fallback;
+  return list.reduce((s, p) => s + p.overall, 0) / list.length;
+}
 
-  // Boosts from win/loss packs (see packs.js) nudge this up over the season.
-  boosts.forEach((b) => (strength += b.amount));
+function rand(spread) {
+  return (Math.random() - 0.5) * spread;
+}
 
-  return strength;
+// A unit's rating, including any impact defenders assigned to it via packs.
+// OL and ST aren't boosted by named players yet -- only by Unit Upgrade packs.
+export function effectiveUnitRating(roster, unit) {
+  const base = roster.units[unit];
+  if (unit === "OL" || unit === "ST") return base;
+  const assigned = roster.defensePlayers.filter((p) => TAG_TO_UNIT[p.tags[0]] === unit);
+  if (!assigned.length) return base;
+  const bonus = assigned.reduce((s, p) => s + Math.max(0, p.overall - 60) * 0.5, 0);
+  return Math.min(99, base + bonus);
+}
+
+function getDefenseProfile(entity) {
+  if (entity.units) {
+    return {
+      passRush: effectiveUnitRating(entity, "DL"),
+      coverage: effectiveUnitRating(entity, "Secondary"),
+      runStop: effectiveUnitRating(entity, "LB"),
+    };
+  }
+  const defAvg = entity.defense.reduce((s, p) => s + p.overall, 0) / entity.defense.length;
+  return {
+    passRush: avgOr(entity.defense.filter((p) => p.tags.includes("pass_rush")), defAvg),
+    coverage: avgOr(entity.defense.filter((p) => p.tags.includes("coverage")), defAvg),
+    runStop: avgOr(entity.defense.filter((p) => p.tags.includes("run_stopper")), defAvg),
+  };
+}
+
+// Weighted overall for a full team/roster -- the core "how good are you" number.
+export function teamStrength(entity) {
+  const wrAvg = entity.wrs.reduce((s, p) => s + p.overall, 0) / entity.wrs.length;
+  const ol = entity.units ? entity.units.OL : OPPONENT_OL;
+  const st = entity.units ? effectiveUnitRating(entity, "ST") : OPPONENT_ST;
+  const def = getDefenseProfile(entity);
+  const defAvg = (def.passRush + def.coverage + def.runStop) / 3;
+
+  return (
+    entity.qb.overall * 0.28 +
+    entity.rb.overall * 0.12 +
+    wrAvg * 0.20 +
+    entity.te.overall * 0.08 +
+    ol * 0.10 +
+    defAvg * 0.17 +
+    st * 0.05
+  );
 }
 
 // The core "did you win" roll. Strength difference + chemistry + randomness.
-export function simulateWeek(userTeam, oppTeam, chemistry, userBoosts = []) {
-  const userStrength = teamStrength(userTeam, userBoosts) + (chemistry - 50) * 0.25;
+export function simulateWeek(roster, oppTeam, chemistry) {
+  const userStrength = teamStrength(roster) + (chemistry - 50) * 0.25;
   const oppStrength = teamStrength(oppTeam);
   const diff = userStrength - oppStrength;
 
-  // Logistic curve: bigger talent gaps matter, but there's always upset chance.
   const winProb = 1 / (1 + Math.exp(-diff / 8));
   const won = Math.random() < winProb;
 
-  const grades = generateGrades(userTeam, chemistry, won, diff);
+  const grades = generateGrades(roster, chemistry);
   const { userScore, oppScore } = generateScoreline(won, diff);
-  const playByPlay = generatePlayByPlay(userTeam, oppTeam, grades, won, userScore, oppScore);
 
-  return { won, winProb, grades, userScore, oppScore, playByPlay };
+  return { won, winProb, grades, userScore, oppScore };
 }
 
-// Turns a continuous 0-100 sub-score into a 1-5 grade.
 function toGrade(value) {
   if (value >= 85) return 5;
   if (value >= 70) return 4;
@@ -51,24 +98,19 @@ function toGrade(value) {
   return 1;
 }
 
-function rand(spread) {
-  return (Math.random() - 0.5) * spread;
-}
+function generateGrades(roster, chemistry) {
+  const wrAvg = roster.wrs.reduce((s, p) => s + p.overall, 0) / roster.wrs.length;
+  const def = getDefenseProfile(roster);
+  const ol = roster.units.OL;
+  const st = effectiveUnitRating(roster, "ST");
 
-function generateGrades(team, chemistry, won, diff) {
-  const wrAvg = team.wrs.reduce((s, p) => s + p.overall, 0) / team.wrs.length;
-  const defAvg = team.defense.reduce((s, p) => s + p.overall, 0) / team.defense.length;
-  const passRush = team.defense.filter((p) => p.tags.includes("pass_rush"));
-  const coverage = team.defense.filter((p) => p.tags.includes("coverage"));
-  const runStop = team.defense.filter((p) => p.tags.includes("run_stopper"));
-
-  const passGame = (team.qb.overall * 0.6 + wrAvg * 0.3 + (chemistry - 50) * 0.4) + rand(15);
-  const runGame = (team.rb.overall * 0.7 + team.te.overall * 0.15) + rand(18);
-  const twoMinute = (team.qb.overall * 0.8 + (chemistry - 50) * 0.5) + rand(15);
-  const runDefense = (avgOr(runStop, defAvg)) + rand(15);
-  const passDefense = (avgOr(coverage, defAvg) * 0.6 + avgOr(passRush, defAvg) * 0.4) + rand(15);
-  const turnovers = (team.qb.overall - 20) + rand(25); // higher QB overall -> fewer giveaways
-  const specialTeams = 60 + rand(30);
+  const passGame = roster.qb.overall * 0.5 + wrAvg * 0.2 + ol * 0.15 + (chemistry - 50) * 0.4 + rand(15);
+  const runGame = roster.rb.overall * 0.5 + ol * 0.4 + rand(18);
+  const twoMinute = roster.qb.overall * 0.75 + (chemistry - 50) * 0.5 + rand(15);
+  const runDefense = def.runStop + rand(15);
+  const passDefense = def.coverage * 0.5 + def.passRush * 0.5 + rand(15);
+  const turnovers = roster.qb.overall - 20 + rand(25); // higher QB overall -> fewer giveaways
+  const specialTeams = st + rand(20);
 
   return {
     "Pass Game": toGrade(passGame),
@@ -81,11 +123,6 @@ function generateGrades(team, chemistry, won, diff) {
   };
 }
 
-function avgOr(list, fallback) {
-  if (!list.length) return fallback;
-  return list.reduce((s, p) => s + p.overall, 0) / list.length;
-}
-
 function generateScoreline(won, diff) {
   const base = 20 + Math.round(rand(14));
   const margin = Math.max(1, Math.round(Math.abs(diff) / 2 + rand(6)));
@@ -94,54 +131,35 @@ function generateScoreline(won, diff) {
   return { userScore: Math.max(userScore, 3), oppScore: Math.max(oppScore, 3) };
 }
 
-// Simple scripted-feeling ticker lines. This is the "option 1" version --
-// text lines that reveal one at a time. Swap this function out later for
-// the fancier animated version without touching anything else.
-function generatePlayByPlay(userTeam, oppTeam, grades, won, userScore, oppScore) {
+// Simple scripted-feeling ticker lines -- text lines that reveal one at a
+// time (the "easiest for now" version). Swap this out later for the
+// fancier animated version without touching anything else.
+export function generatePlayByPlay(userCity, oppCity, roster, grades, won, userScore, oppScore) {
   const lines = [];
-  const u = userTeam.city;
-  const o = oppTeam.city;
+  lines.push(`Kickoff: ${userCity} vs ${oppCity}`);
 
-  lines.push(`Kickoff: ${u} ${userTeam.name} vs ${o} ${oppTeam.name}`);
+  if (grades["Pass Game"] >= 4) lines.push(`${roster.qb.name} is slicing this defense up through the air.`);
+  else if (grades["Pass Game"] <= 2) lines.push(`${roster.qb.name} is under siege -- the passing game can't find a rhythm.`);
 
-  if (grades["Pass Game"] >= 4) {
-    lines.push(`${userTeam.qb.name} is slicing this defense up through the air.`);
-  } else if (grades["Pass Game"] <= 2) {
-    lines.push(`${userTeam.qb.name} is under siege -- the passing game can't find a rhythm.`);
-  }
+  if (grades["Run Game"] >= 4) lines.push(`${roster.rb.name} is breaking off chunk runs all afternoon.`);
+  else if (grades["Run Game"] <= 2) lines.push(`${roster.rb.name} can't find a crease -- the run game stalls.`);
 
-  if (grades["Run Game"] >= 4) {
-    lines.push(`${userTeam.rb.name} is breaking off chunk runs all afternoon.`);
-  } else if (grades["Run Game"] <= 2) {
-    lines.push(`${userTeam.rb.name} can't find a crease -- the run game stalls.`);
-  }
+  if (grades["Turnover Battle"] <= 2) lines.push(`Costly turnover for ${userCity} -- ${oppCity} capitalizes.`);
+  else if (grades["Turnover Battle"] >= 4) lines.push(`${userCity}'s defense forces a turnover at a huge moment.`);
 
-  if (grades["Turnover Battle"] <= 2) {
-    lines.push(`Costly turnover for ${u} -- ${o} capitalizes.`);
-  } else if (grades["Turnover Battle"] >= 4) {
-    lines.push(`${u}'s defense forces a turnover at a huge moment.`);
-  }
+  if (grades["Pass Defense"] >= 4) lines.push(`The secondary is locking receivers down -- ${oppCity}'s passing attack is stuck.`);
+  if (grades["Run Defense"] >= 4) lines.push(`The front seven is stuffing every run ${oppCity} tries.`);
+  if (grades["2-Minute Offense"] >= 4) lines.push(`Clutch two-minute drive from ${roster.qb.name} before the half.`);
 
-  if (grades["Pass Defense"] >= 4) {
-    lines.push(`The secondary is locking receivers down -- ${o}'s passing attack is stuck.`);
-  }
-  if (grades["Run Defense"] >= 4) {
-    lines.push(`The front seven is stuffing every run ${o} tries.`);
-  }
-
-  if (grades["2-Minute Offense"] >= 4) {
-    lines.push(`Clutch two-minute drive from ${userTeam.qb.name} before the half.`);
-  }
-
-  lines.push(`FINAL: ${u} ${userScore} -- ${o} ${oppScore}`);
-  lines.push(won ? `${u} win it.` : `${u} fall short.`);
+  lines.push(`FINAL: ${userCity} ${userScore} -- ${oppCity} ${oppScore}`);
+  lines.push(won ? `${userCity} win it.` : `${userCity} fall short.`);
 
   return lines;
 }
 
 // QB choice multiplier: picking a lower-overall QB out of the 3 offered
-// gives a bigger multiplier on your final score. Scaled against the best
-// overall in the choice set, not some fixed number, so it stays fair no
+// gives a bigger multiplier on your final score, scaled against the best
+// overall in the choice set (not a fixed number) so it stays fair no
 // matter which 3 QBs get offered.
 export function computeQbMultiplier(chosenQb, choiceSet) {
   const best = Math.max(...choiceSet.map((q) => q.overall));

@@ -18,6 +18,22 @@ const COMPAT = {
   play_action: ["possession", "deep_threat"],
 };
 
+// Shared by engine.js (grading) and packs.js (slotting defenders into units).
+// Kept here since it's fundamentally about what a tag *means*.
+export const TAG_TO_UNIT = {
+  pass_rush: "DL",
+  coverage: "Secondary",
+  run_stopper: "LB",
+};
+
+export const UNIT_LABEL = {
+  OL: "O-Line",
+  DL: "D-Line",
+  LB: "Linebackers",
+  Secondary: "Secondary",
+  ST: "Special Teams",
+};
+
 // Returns a 0-100 chemistry score for a QB + their RB, WR1 (top WR), and TE.
 export function computeChemistry(qb, rb, wr1, te) {
   const supportingPlayers = [rb, wr1, te];

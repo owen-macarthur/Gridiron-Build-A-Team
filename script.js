@@ -4,10 +4,10 @@
 // all lives in engine.js / chemistry.js / packs.js. If you're tuning
 // numbers, you almost certainly want one of those files instead.
 // -----------------------------------------------------------------------
-import { TEAMS } from "./data.js";
-import { computeChemistry, explainChemistry } from "./chemistry.js";
-import { teamStrength, simulateWeek, computeQbMultiplier, computeSeasonScore } from "./engine.js";
-import { generateWinPack, generateLossPack, tickBoosts, describeDefender } from "./packs.js";
+import { TEAMS, createDefaultRoster } from "./data.js";
+import { computeChemistry, explainChemistry, UNIT_LABEL, TAG_TO_UNIT } from "./chemistry.js";
+import { teamStrength, simulateWeek, generatePlayByPlay, computeQbMultiplier, computeSeasonScore, effectiveUnitRating } from "./engine.js";
+import { generateWinPack, generateLossPack, tickRentals } from "./packs.js";
 
 const WEEKS_TOTAL = 8; // Prototype length. Full version target: 17 + playoffs.
 const PLAYOFF_LINE = Math.ceil((WEEKS_TOTAL * 10) / 17); // scaled version of "10-7 or better"
@@ -16,18 +16,24 @@ const app = document.getElementById("app");
 
 let state = null;
 
-function newGameState() {
+function newGameState(identity, qb, choiceSet) {
   return {
-    team: null,
-    qbMultiplier: 1,
-    chemistry: 50,
-    boosts: [],
+    identity,                 // the real team you drafted from (city/name/color, for flavor + opponent pool exclusion)
+    roster: createDefaultRoster(qb), // your actual playable roster -- starts nearly empty
+    qbMultiplier: computeQbMultiplier(qb, choiceSet),
+    rentals: [],               // active rental tracking (see packs.js tickRentals)
     week: 1,
     wins: 0,
     losses: 0,
     streak: 0,
-    gradeHistory: [], // array of grade objects, one per week
+    gradeHistory: [],
   };
+}
+
+function currentChemistry() {
+  const r = state.roster;
+  const topWr = r.wrs.reduce((best, w) => (w.overall > best.overall ? w : best), r.wrs[0]);
+  return computeChemistry(r.qb, r.rb, topWr, r.te);
 }
 
 // ---------------------------------------------------------------------
@@ -37,13 +43,10 @@ function renderTitle() {
   app.innerHTML = `
     <div class="eyebrow">Underdog GM &middot; Prototype</div>
     <h1>UNDERDOG GM</h1>
-    <p>Draft a QB, build chemistry, and see how far you can carry a roster that isn't stacked. Beat the odds and your score multiplier climbs.</p>
+    <p>Draft a QB, build a roster from nothing, and see how far you can carry a team that isn't stacked. Beat the odds and your score multiplier climbs.</p>
     <button id="start-btn">Start Season</button>
   `;
-  document.getElementById("start-btn").addEventListener("click", () => {
-    state = newGameState();
-    renderQbSelect();
-  });
+  document.getElementById("start-btn").addEventListener("click", renderQbSelect);
 }
 
 // ---------------------------------------------------------------------
@@ -56,7 +59,7 @@ function renderQbSelect() {
   app.innerHTML = `
     <div class="eyebrow">Week 0 &middot; Draft Room</div>
     <h1>Pick Your QB</h1>
-    <p>Lower overall = a bigger multiplier on your final score. Great record with a lesser QB can out-grade a stacked team that just walked in.</p>
+    <p>Everyone else on your roster starts as a replacement-level default player -- your QB is the only proven piece. Lower overall = a bigger multiplier on your final score.</p>
     <div class="card-grid" id="qb-grid"></div>
   `;
 
@@ -73,51 +76,73 @@ function renderQbSelect() {
       <div class="tag-row">${qb.tags.map((t) => `<span class="tag">${t.replace("_", " ")}</span>`).join("")}</div>
       <div class="multiplier-badge"><span>&times;</span><span class="num">${mult.toFixed(2)}</span></div>
     `;
-    const choose = () => chooseQb(team, qb, choices.map((c) => c.qb));
+    const choose = () => {
+      state = newGameState(team, qb, choices.map((c) => c.qb));
+      renderTeamReveal();
+    };
     card.addEventListener("click", choose);
     card.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") choose(); });
     grid.appendChild(card);
   });
 }
 
-function chooseQb(team, qb, choiceSet) {
-  state.team = team;
-  state.qbMultiplier = computeQbMultiplier(qb, choiceSet);
-  state.chemistry = computeChemistry(team.qb, team.rb, team.wrs[0], team.te);
-  renderTeamReveal();
-}
-
 // ---------------------------------------------------------------------
 // Screen: Team reveal + chemistry breakdown
 // ---------------------------------------------------------------------
+function tagRow(tags) {
+  if (!tags.length) return "";
+  return `<div class="tag-row">${tags.map((t) => `<span class="tag">${t.replace("_", " ")}</span>`).join("")}</div>`;
+}
+
 function renderTeamReveal() {
-  const t = state.team;
-  const notes = explainChemistry(t.qb, t.rb, t.wrs[0], t.te);
+  const r = state.roster;
+  const chemistry = currentChemistry();
+  const topWr = r.wrs.reduce((best, w) => (w.overall > best.overall ? w : best), r.wrs[0]);
+  const notes = explainChemistry(r.qb, r.rb, topWr, r.te);
+
+  const defenseByUnit = { DL: [], LB: [], Secondary: [] };
+  r.defensePlayers.forEach((p) => {
+    const unit = TAG_TO_UNIT[p.tags[0]];
+    if (unit && defenseByUnit[unit]) defenseByUnit[unit].push(p);
+  });
+
+  const unitRow = (unitKey) => {
+    const rating = Math.round(effectiveUnitRating(r, unitKey));
+    const players = defenseByUnit[unitKey] || [];
+    return `
+      <div class="roster-row"><span class="roster-role">${unitKey}</span><span>${UNIT_LABEL[unitKey]}</span><span class="overall-pill">${rating}</span></div>
+      ${players.map((p) => `
+        <div class="roster-row" style="padding-left:16px;"><span class="roster-role">${p.pos}</span><span>${p.name}${tagRow(p.tags)}</span><span class="overall-pill">${p.overall}</span></div>
+      `).join("")}
+    `;
+  };
 
   app.innerHTML = `
     ${statusStrip()}
     <div class="eyebrow">Your Squad</div>
-    <h1>${t.city} ${t.name}</h1>
+    <h1>${state.identity.city} ${state.identity.name}</h1>
     <div class="multiplier-badge"><span>Score Multiplier</span><span class="num">&times;${state.qbMultiplier.toFixed(2)}</span></div>
 
     <div class="card" style="margin-top:18px;">
-      <h2>Chemistry: ${state.chemistry}/100</h2>
-      ${notes.length
-        ? `<p>${notes.join(". ")}.</p>`
-        : `<p>No standout tag pairings yet -- a fairly neutral fit.</p>`}
+      <h2>Chemistry: ${chemistry}/100</h2>
+      ${notes.length ? `<p>${notes.join(". ")}.</p>` : `<p>No standout tag pairings yet -- get some real skill players via packs to build chemistry.</p>`}
     </div>
 
     <div class="card">
       <h3>Offense</h3>
-      <div class="roster-row"><span class="roster-role">QB</span><span>${t.qb.name}</span><span class="overall-pill">${t.qb.overall}</span></div>
-      <div class="roster-row"><span class="roster-role">RB</span><span>${t.rb.name}</span><span class="overall-pill">${t.rb.overall}</span></div>
-      ${t.wrs.map((w, i) => `<div class="roster-row"><span class="roster-role">WR${i + 1}</span><span>${w.name}</span><span class="overall-pill">${w.overall}</span></div>`).join("")}
-      <div class="roster-row"><span class="roster-role">TE</span><span>${t.te.name}</span><span class="overall-pill">${t.te.overall}</span></div>
+      <div class="roster-row"><span class="roster-role">QB</span><span>${r.qb.name}${tagRow(r.qb.tags)}</span><span class="overall-pill">${r.qb.overall}</span></div>
+      <div class="roster-row"><span class="roster-role">RB</span><span>${r.rb.name}${tagRow(r.rb.tags)}</span><span class="overall-pill">${r.rb.overall}</span></div>
+      ${r.wrs.map((w, i) => `<div class="roster-row"><span class="roster-role">WR${i + 1}</span><span>${w.name}${tagRow(w.tags)}</span><span class="overall-pill">${w.overall}</span></div>`).join("")}
+      <div class="roster-row"><span class="roster-role">TE</span><span>${r.te.name}${tagRow(r.te.tags)}</span><span class="overall-pill">${r.te.overall}</span></div>
+      <div class="roster-row"><span class="roster-role">OL</span><span>${UNIT_LABEL.OL}</span><span class="overall-pill">${r.units.OL}</span></div>
     </div>
 
     <div class="card">
-      <h3>Impact Defense</h3>
-      ${t.defense.map((d) => `<div class="roster-row"><span class="roster-role">${d.pos}</span><span>${d.name}</span><span class="overall-pill">${d.overall}</span></div>`).join("")}
+      <h3>Defense &amp; Special Teams</h3>
+      ${unitRow("DL")}
+      ${unitRow("LB")}
+      ${unitRow("Secondary")}
+      <div class="roster-row"><span class="roster-role">ST</span><span>${UNIT_LABEL.ST}</span><span class="overall-pill">${Math.round(effectiveUnitRating(r, "ST"))}</span></div>
     </div>
 
     <button id="play-btn">Play Week ${state.week}</button>
@@ -129,57 +154,72 @@ function renderTeamReveal() {
 // Screen: Weekly sim ticker
 // ---------------------------------------------------------------------
 function playWeek() {
-  const opponents = TEAMS.filter((t) => t.code !== state.team.code);
+  const opponents = TEAMS.filter((t) => t.code !== state.identity.code);
   const opponent = opponents[Math.floor(Math.random() * opponents.length)];
-  const result = simulateWeek(state.team, opponent, state.chemistry, state.boosts);
+  runSim(opponent, false);
+}
+
+function runSim(opponent, isPlayoff) {
+  const chemistry = currentChemistry();
+  const result = simulateWeek(state.roster, opponent, chemistry);
+  const lines = generatePlayByPlay(state.identity.city, opponent.city, state.roster, result.grades, result.won, result.userScore, result.oppScore);
 
   app.innerHTML = `
     ${statusStrip()}
-    <div class="eyebrow">Week ${state.week} &middot; Live</div>
-    <h1>${state.team.city} vs ${opponent.city}</h1>
+    <div class="eyebrow">${isPlayoff ? "Playoffs" : `Week ${state.week}`} &middot; Live</div>
+    <h1>${state.identity.city} vs ${opponent.city}</h1>
     <div class="ticker" id="ticker"></div>
   `;
 
   const ticker = document.getElementById("ticker");
-  result.playByPlay.forEach((line, i) => {
+  lines.forEach((line, i) => {
     setTimeout(() => {
       const div = document.createElement("div");
       div.className = "ticker-line";
       div.textContent = line;
       ticker.appendChild(div);
-      if (i === result.playByPlay.length - 1) {
-        setTimeout(() => renderWeekResult(opponent, result), 700);
+      if (i === lines.length - 1) {
+        const btn = document.createElement("button");
+        btn.textContent = "Next";
+        btn.style.marginTop = "16px";
+        btn.addEventListener("click", () => {
+          if (isPlayoff) renderPlayoffResult(opponent, result);
+          else renderWeekResult(opponent, result);
+        });
+        ticker.appendChild(btn);
       }
     }, i * 550);
   });
 }
 
-// ---------------------------------------------------------------------
-// Screen: Grades + win/loss result
-// ---------------------------------------------------------------------
-function renderWeekResult(opponent, result) {
-  state.gradeHistory.push(result.grades);
-  if (result.won) { state.wins++; state.streak++; } else { state.losses++; state.streak = 0; }
-
-  const gradeRows = Object.entries(result.grades)
+function gradeRowsHtml(grades) {
+  return Object.entries(grades)
     .map(([label, grade]) => `
       <div class="grade-row">
         <span class="grade-label">${label}</span>
         <span class="grade-stars">${"★".repeat(grade)}<span class="dim">${"★".repeat(5 - grade)}</span></span>
       </div>`)
     .join("");
+}
+
+// ---------------------------------------------------------------------
+// Screen: Grades + win/loss result (regular season)
+// ---------------------------------------------------------------------
+function renderWeekResult(opponent, result) {
+  state.gradeHistory.push(result.grades);
+  if (result.won) { state.wins++; state.streak++; } else { state.losses++; state.streak = 0; }
 
   app.innerHTML = `
     ${statusStrip()}
     <div class="result-banner ${result.won ? "win" : "loss"}">${result.won ? "WIN" : "LOSS"}</div>
     <div class="scoreboard">
-      <span>${state.team.city} ${result.userScore}</span>
+      <span>${state.identity.city} ${result.userScore}</span>
       <span class="vs">FINAL</span>
       <span>${opponent.city} ${result.oppScore}</span>
     </div>
     <div class="card">
       <h2>Game Grades</h2>
-      ${gradeRows}
+      ${gradeRowsHtml(result.grades)}
     </div>
     <button id="pack-btn">Open ${result.won ? "Win" : "Loss"} Pack</button>
   `;
@@ -190,7 +230,7 @@ function renderWeekResult(opponent, result) {
 // Screen: Pack selection
 // ---------------------------------------------------------------------
 function renderPackScreen(won) {
-  const options = won ? generateWinPack(state.streak) : generateLossPack();
+  const options = won ? generateWinPack(state.streak, state.roster) : generateLossPack(state.roster);
 
   app.innerHTML = `
     ${statusStrip()}
@@ -216,31 +256,68 @@ function renderPackScreen(won) {
 }
 
 function renderPackConfirm(opt) {
-  const defenderNote = state.team.defense
-    .map((d) => `${d.name} (${d.pos}) ${describeDefender(d.tags[0])}`)
-    .slice(0, 1)[0];
-
+  const nextLabel = state.week >= WEEKS_TOTAL ? "See Season Recap" : `Continue to Week ${state.week + 1}`;
   app.innerHTML = `
     ${statusStrip()}
     <div class="card">
       <h2>Added: ${opt.title}</h2>
       <p>${opt.description}</p>
-      <p style="color:var(--muted); font-size:0.85rem;">Reminder -- your existing impact defender ${defenderNote}.</p>
     </div>
-    <button id="continue-btn">${state.week >= WEEKS_TOTAL ? "See Season Recap" : `Continue to Week ${state.week + 1}`}</button>
+    <button id="continue-btn">${nextLabel}</button>
   `;
   document.getElementById("continue-btn").addEventListener("click", () => {
-    tickBoosts(state);
+    tickRentals(state);
     state.week++;
-    if (state.week > WEEKS_TOTAL) renderRecap();
-    else renderTeamReveal();
+    if (state.week > WEEKS_TOTAL) {
+      if (state.wins >= PLAYOFF_LINE) renderPlayoffIntro();
+      else renderRecap(false);
+    } else {
+      renderTeamReveal();
+    }
   });
+}
+
+// ---------------------------------------------------------------------
+// Screens: Playoffs (no packs after these games)
+// ---------------------------------------------------------------------
+function renderPlayoffIntro() {
+  app.innerHTML = `
+    ${statusStrip()}
+    <div class="eyebrow">You Clinched a Spot</div>
+    <h1>Playoffs</h1>
+    <p>You hit the ${PLAYOFF_LINE}-${WEEKS_TOTAL - PLAYOFF_LINE} playoff line. One game, win or go home. No pack afterward -- this one's just for the record book.</p>
+    <button id="playoff-btn">Play Playoff Game</button>
+  `;
+  document.getElementById("playoff-btn").addEventListener("click", () => {
+    const field = TEAMS.filter((t) => t.code !== state.identity.code);
+    const opponent = field.reduce((strongest, t) => (teamStrength(t) > teamStrength(strongest) ? t : strongest), field[0]);
+    runSim(opponent, true);
+  });
+}
+
+function renderPlayoffResult(opponent, result) {
+  state.playoffResult = result.won ? "won" : "lost";
+  app.innerHTML = `
+    ${statusStrip()}
+    <div class="result-banner ${result.won ? "win" : "loss"}">${result.won ? "PLAYOFF WIN" : "ELIMINATED"}</div>
+    <div class="scoreboard">
+      <span>${state.identity.city} ${result.userScore}</span>
+      <span class="vs">FINAL</span>
+      <span>${opponent.city} ${result.oppScore}</span>
+    </div>
+    <div class="card">
+      <h2>Game Grades</h2>
+      ${gradeRowsHtml(result.grades)}
+    </div>
+    <button id="recap-btn">See Season Recap</button>
+  `;
+  document.getElementById("recap-btn").addEventListener("click", () => renderRecap(true));
 }
 
 // ---------------------------------------------------------------------
 // Screen: Season recap
 // ---------------------------------------------------------------------
-function renderRecap() {
+function renderRecap(reachedPlayoffs) {
   const catTotals = {};
   state.gradeHistory.forEach((g) => {
     Object.entries(g).forEach(([k, v]) => { catTotals[k] = (catTotals[k] || 0) + v; });
@@ -251,15 +328,19 @@ function renderRecap() {
   );
   const avgGradeTotal = Object.values(catAverages).reduce((s, v) => s + parseFloat(v), 0);
   const { finalScore, letter } = computeSeasonScore(state.wins, state.losses, avgGradeTotal, state.qbMultiplier);
-  const madePlayoffs = state.wins >= PLAYOFF_LINE;
+
+  let playoffLine = `Missed the ${PLAYOFF_LINE}-${WEEKS_TOTAL - PLAYOFF_LINE} playoff line. (Full 17-game version: 10-7.)`;
+  if (reachedPlayoffs) {
+    playoffLine = state.playoffResult === "won"
+      ? `Clinched the playoffs and won your playoff game.`
+      : `Clinched the playoffs but were eliminated.`;
+  }
 
   app.innerHTML = `
     <div class="eyebrow">Season Recap</div>
-    <h1>${state.team.city} ${state.team.name}</h1>
+    <h1>${state.identity.city} ${state.identity.name}</h1>
     <p>Final Record: <strong>${state.wins}-${state.losses}</strong> &middot; QB Multiplier: <strong>&times;${state.qbMultiplier.toFixed(2)}</strong></p>
-    <p>${madePlayoffs
-      ? `You hit the ${PLAYOFF_LINE}-${weeks - PLAYOFF_LINE} playoff line. (Full 17-game version: 10-7.)`
-      : `Missed the ${PLAYOFF_LINE}-${weeks - PLAYOFF_LINE} playoff line. (Full 17-game version: 10-7.)`}</p>
+    <p>${playoffLine}</p>
 
     <div class="final-grade">${letter}</div>
     <p style="text-align:center; color:var(--muted);">Score: ${finalScore}</p>
@@ -280,10 +361,10 @@ function renderRecap() {
 // Shared status strip
 // ---------------------------------------------------------------------
 function statusStrip() {
-  if (!state.team) return "";
+  if (!state) return "";
   return `
     <div class="status-strip">
-      <span>WEEK ${state.week}/${WEEKS_TOTAL}</span>
+      <span>WEEK ${Math.min(state.week, WEEKS_TOTAL)}/${WEEKS_TOTAL}</span>
       <span>RECORD ${state.wins}-${state.losses}</span>
       <span>STREAK ${state.streak}</span>
       <span>MULT &times;${state.qbMultiplier.toFixed(2)}</span>
