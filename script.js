@@ -4,13 +4,14 @@
 // all lives in engine.js / chemistry.js / packs.js. If you're tuning
 // numbers, you almost certainly want one of those files instead.
 // -----------------------------------------------------------------------
-import { TEAMS, createDefaultRoster } from "./data.js";
-import { computeChemistry, explainChemistry, UNIT_LABEL, TAG_TO_UNIT } from "./chemistry.js";
+import { TEAMS, createDefaultRoster, FREE_AGENTS } from "./data.js";
+import { computeChemistry, explainChemistry, tagsFitQb, UNIT_LABEL, TAG_TO_UNIT } from "./chemistry.js";
 import { teamStrength, simulateWeek, generatePlayByPlay, computeQbMultiplier, computeFinalScore, effectiveUnitRating } from "./engine.js";
-import { generateWinPack, generateLossPack, tickRentals } from "./packs.js";
+import { generateWinPack, generateLossPack, generateIntroPack, tickRentals } from "./packs.js";
 
 const WEEKS_TOTAL = 8; // Prototype length. Full version target: 17 + playoffs.
 const PLAYOFF_LINE = Math.ceil((WEEKS_TOTAL * 10) / 17); // scaled version of "10-7 or better"
+const SPIN_MS = 1100; // how long a pack card "spins" before revealing
 
 const app = document.getElementById("app");
 
@@ -21,7 +22,7 @@ function newGameState(identity, qb, choiceSet) {
     identity,                        // the real team you drafted from (city/name/color, flavor only)
     roster: createDefaultRoster(qb), // your actual playable roster -- starts nearly empty
     qbMultiplier: computeQbMultiplier(qb, choiceSet),
-    rentals: [],                     // active rental tracking (see packs.js tickRentals)
+    rentals: [],                     // active rental tracking, ticked only when a game is played (runSim)
     ownedPlayers: new Set(),         // every player name ever acquired -- packs never repeat these
     week: 1,
     wins: 0,
@@ -37,11 +38,21 @@ function currentChemistry() {
   return computeChemistry(r.qb, r.rb, topWr, r.te);
 }
 
-// Consistent "what phase of the game am I in" heading, shown at the top
-// of every screen so it's clear where you are even as the game progresses
-// through a lot of different states.
 function phaseHeading(text) {
   return `<div class="eyebrow">${text}</div>`;
+}
+
+function tagRow(tags) {
+  if (!tags.length) return "";
+  return `<div class="tag-row">${tags.map((t) => `<span class="tag">${t.replace("_", " ")}</span>`).join("")}</div>`;
+}
+
+// Small "games left" pill for a rental-tracked slot, or "" if it's not a rental.
+function rentalBadge(kind, slot, wrIndexOrPlayer) {
+  const r = kind === "skill"
+    ? state.rentals.find((x) => x.kind === "skill" && x.slot === slot && (slot !== "wr" || x.wrIndex === wrIndexOrPlayer))
+    : state.rentals.find((x) => x.kind === "defense" && x.player === wrIndexOrPlayer);
+  return r ? `<span class="tag">⏳ ${r.gamesLeft} left</span>` : "";
 }
 
 // ---------------------------------------------------------------------
@@ -86,7 +97,7 @@ function renderQbSelect() {
     `;
     const choose = () => {
       state = newGameState(team, qb, choices.map((c) => c.qb));
-      renderTeamReveal();
+      renderIntroPack();
     };
     card.addEventListener("click", choose);
     card.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") choose(); });
@@ -95,13 +106,108 @@ function renderQbSelect() {
 }
 
 // ---------------------------------------------------------------------
-// Screen: Team reveal + chemistry breakdown
+// Screen: Intro Pack -- automatic 2 offense + 2 defense to start the season
 // ---------------------------------------------------------------------
-function tagRow(tags) {
-  if (!tags.length) return "";
-  return `<div class="tag-row">${tags.map((t) => `<span class="tag">${t.replace("_", " ")}</span>`).join("")}</div>`;
+function renderIntroPack() {
+  const picks = generateIntroPack(state.ownedPlayers);
+
+  app.innerHTML = `
+    ${phaseHeading("Intro Pack")}
+    <h1>Your Starting Reinforcements</h1>
+    <p>Before Week 1, you get a baseline: 2 offensive and 2 defensive players, yours for the season.</p>
+    <div class="card-grid" id="intro-grid"></div>
+    <button id="intro-continue-btn" style="margin-top:16px; display:none;">Continue to Week 1</button>
+  `;
+
+  const grid = document.getElementById("intro-grid");
+  picks.forEach((opt) => grid.appendChild(buildSpinCard(opt)));
+
+  spinAll(picks, () => {
+    picks.forEach((opt) => opt.apply(state));
+    const btn = document.getElementById("intro-continue-btn");
+    btn.style.display = "";
+    btn.addEventListener("click", renderTeamReveal);
+  });
 }
 
+// ---------------------------------------------------------------------
+// Pack-card spin helpers (shared by intro/win/loss packs)
+// ---------------------------------------------------------------------
+function buildSpinCard(opt) {
+  const card = document.createElement("div");
+  card.className = "card pack-option";
+  card.setAttribute("data-id", opt.id);
+  card.innerHTML = `
+    <h3>${opt.title === opt.player?.name ? "New Player" : opt.title}</h3>
+    <div class="spin-name qb-name">? ? ?</div>
+    <div class="pack-reveal" style="display:none;"></div>
+  `;
+  return card;
+}
+
+// Cycles each card's name through random candidates from the same tier as
+// the real pick, then locks in on the true result. Selection is disabled
+// on a card until its spin finishes.
+function spinAll(options, onAllDone) {
+  let remaining = options.length;
+  options.forEach((opt) => {
+    const card = app.querySelector(`.pack-option[data-id="${opt.id}"]`);
+    const nameEl = card.querySelector(".spin-name");
+
+    if (!opt.player) {
+      // Unit upgrades aren't a "player pull" -- reveal immediately, no spin.
+      finishSpin();
+      return;
+    }
+
+    const candidates = [
+      ...FREE_AGENTS.superstar, ...FREE_AGENTS.great, ...FREE_AGENTS.solid, ...FREE_AGENTS.depth,
+    ].filter((p) => p.pos === opt.player.pos || p.name === opt.player.name);
+    const namesToSpin = candidates.length ? candidates : [opt.player];
+
+    let ticks = 0;
+    const totalTicks = Math.round(SPIN_MS / 70);
+    const interval = setInterval(() => {
+      nameEl.textContent = namesToSpin[Math.floor(Math.random() * namesToSpin.length)].name;
+      ticks++;
+      if (ticks >= totalTicks) {
+        clearInterval(interval);
+        nameEl.textContent = opt.player.name;
+        finishSpin();
+      }
+    }, 70);
+  });
+
+  function finishSpin() {
+    remaining--;
+    if (remaining === 0) onAllDone();
+  }
+
+  // Reveal each card's detail content once its own spin lands.
+  options.forEach((opt) => {
+    const card = app.querySelector(`.pack-option[data-id="${opt.id}"]`);
+    const check = setInterval(() => {
+      const nameEl = card.querySelector(".spin-name");
+      const isDone = !opt.player || nameEl.textContent === opt.player.name;
+      if (isDone) {
+        clearInterval(check);
+        const reveal = card.querySelector(".pack-reveal");
+        const fit = opt.player && tagsFitQb(state.roster.qb.tags, opt.player.tags);
+        reveal.innerHTML = `
+          <p>${opt.description}</p>
+          ${opt.player ? tagRow(opt.player.tags) : ""}
+          ${fit ? `<span class="tag">✓ Scheme Fit</span>` : ""}
+        `;
+        reveal.style.display = "";
+        if (!opt.player) nameEl.parentElement.querySelector(".spin-name")?.remove?.();
+      }
+    }, 80);
+  });
+}
+
+// ---------------------------------------------------------------------
+// Screen: Team reveal + chemistry breakdown
+// ---------------------------------------------------------------------
 function renderTeamReveal() {
   const r = state.roster;
   const chemistry = currentChemistry();
@@ -120,7 +226,7 @@ function renderTeamReveal() {
     return `
       <div class="roster-row"><span class="roster-role">${unitKey}</span><span>${UNIT_LABEL[unitKey]}</span><span class="overall-pill">${rating}</span></div>
       ${players.map((p) => `
-        <div class="roster-row" style="padding-left:16px;"><span class="roster-role">${p.pos}</span><span>${p.name}${tagRow(p.tags)}</span><span class="overall-pill">${p.overall}</span></div>
+        <div class="roster-row" style="padding-left:16px;"><span class="roster-role">${p.pos}</span><span>${p.name}${tagRow(p.tags)}${rentalBadge("defense", null, p)}</span><span class="overall-pill">${p.overall}</span></div>
       `).join("")}
     `;
   };
@@ -139,9 +245,9 @@ function renderTeamReveal() {
     <div class="card">
       <h3>Offense</h3>
       <div class="roster-row"><span class="roster-role">QB</span><span>${r.qb.name}${tagRow(r.qb.tags)}</span><span class="overall-pill">${r.qb.overall}</span></div>
-      <div class="roster-row"><span class="roster-role">RB</span><span>${r.rb.name}${tagRow(r.rb.tags)}</span><span class="overall-pill">${r.rb.overall}</span></div>
-      ${r.wrs.map((w, i) => `<div class="roster-row"><span class="roster-role">WR${i + 1}</span><span>${w.name}${tagRow(w.tags)}</span><span class="overall-pill">${w.overall}</span></div>`).join("")}
-      <div class="roster-row"><span class="roster-role">TE</span><span>${r.te.name}${tagRow(r.te.tags)}</span><span class="overall-pill">${r.te.overall}</span></div>
+      <div class="roster-row"><span class="roster-role">RB</span><span>${r.rb.name}${tagRow(r.rb.tags)}${rentalBadge("skill", "rb")}</span><span class="overall-pill">${r.rb.overall}</span></div>
+      ${r.wrs.map((w, i) => `<div class="roster-row"><span class="roster-role">WR${i + 1}</span><span>${w.name}${tagRow(w.tags)}${rentalBadge("skill", "wr", i)}</span><span class="overall-pill">${w.overall}</span></div>`).join("")}
+      <div class="roster-row"><span class="roster-role">TE</span><span>${r.te.name}${tagRow(r.te.tags)}${rentalBadge("skill", "te")}</span><span class="overall-pill">${r.te.overall}</span></div>
       <div class="roster-row"><span class="roster-role">OL</span><span>${UNIT_LABEL.OL}</span><span class="overall-pill">${r.units.OL}</span></div>
     </div>
 
@@ -159,18 +265,49 @@ function renderTeamReveal() {
 }
 
 // ---------------------------------------------------------------------
+// Screen: Opponent preview (short scouting snapshot before kickoff)
+// ---------------------------------------------------------------------
+function strengthTier(strength) {
+  if (strength >= 90) return "Elite";
+  if (strength >= 85) return "Strong";
+  if (strength >= 78) return "Average";
+  return "Rebuilding";
+}
+
+function renderOpponentPreview(opponent, isPlayoff) {
+  const strength = teamStrength(opponent);
+  app.innerHTML = `
+    ${statusStrip()}
+    ${phaseHeading(isPlayoff ? "Playoffs &middot; Scouting Report" : `Regular Season &middot; Week ${state.week} &middot; Scouting Report`)}
+    <h1>${opponent.city} ${opponent.name}</h1>
+    <div class="card">
+      <div class="roster-row"><span class="roster-role">TIER</span><span>${strengthTier(strength)}</span><span class="overall-pill">${Math.round(strength)}</span></div>
+      <div class="roster-row"><span class="roster-role">QB</span><span>${opponent.qb.name}${tagRow(opponent.qb.tags)}</span><span class="overall-pill">${opponent.qb.overall}</span></div>
+    </div>
+    <button id="kickoff-btn">Kickoff</button>
+  `;
+  document.getElementById("kickoff-btn").addEventListener("click", () => runSim(opponent, isPlayoff));
+}
+
+// ---------------------------------------------------------------------
 // Screen: Weekly sim ticker
 // ---------------------------------------------------------------------
 function playWeek() {
   const opponents = TEAMS.filter((t) => t.code !== state.identity.code);
   const opponent = opponents[Math.floor(Math.random() * opponents.length)];
-  runSim(opponent, false);
+  renderOpponentPreview(opponent, false);
 }
 
 function runSim(opponent, isPlayoff) {
   const chemistry = currentChemistry();
   const result = simulateWeek(state.roster, opponent, chemistry);
   const lines = generatePlayByPlay(state.identity.city, opponent.city, state.roster, result.grades, result.won, result.userScore, result.oppScore);
+
+  // Tick rentals now -- this game is the one "using up" a rental's game,
+  // so this must happen only once, exactly when a game is actually played
+  // (not when a pack is confirmed). Ticker text above already used the
+  // pre-tick roster, which is correct: those are the players who played.
+  tickRentals(state);
 
   app.innerHTML = `
     ${statusStrip()}
@@ -236,7 +373,7 @@ function renderWeekResult(opponent, result) {
 }
 
 // ---------------------------------------------------------------------
-// Screen: Pack selection
+// Screen: Pack selection (with spin reveal)
 // ---------------------------------------------------------------------
 function renderPackScreen(won) {
   const options = won
@@ -247,23 +384,26 @@ function renderPackScreen(won) {
     ${statusStrip()}
     ${phaseHeading(`${won ? "Win" : "Loss"} Pack`)}
     <h1>Choose Your Reward</h1>
-    ${options.map((opt) => `
-      <div class="card selectable pack-option" data-id="${opt.id}" tabindex="0">
-        <h3>${opt.title}</h3>
-        <p>${opt.description}</p>
-        ${opt.player ? tagRow(opt.player.tags) : ""}
-      </div>`).join("")}
+    <div id="pack-grid"></div>
   `;
 
-  app.querySelectorAll(".pack-option").forEach((el) => {
-    const id = el.getAttribute("data-id");
-    const opt = options.find((o) => o.id === id);
-    const pick = () => {
-      opt.apply(state);
-      renderPackConfirm(opt);
-    };
-    el.addEventListener("click", pick);
-    el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") pick(); });
+  const grid = document.getElementById("pack-grid");
+  options.forEach((opt) => {
+    const card = buildSpinCard(opt);
+    card.classList.add("selectable");
+    card.tabIndex = 0;
+    card.style.pointerEvents = "none"; // enabled once its spin lands
+    grid.appendChild(card);
+  });
+
+  spinAll(options, () => {
+    options.forEach((opt) => {
+      const card = app.querySelector(`.pack-option[data-id="${opt.id}"]`);
+      card.style.pointerEvents = "";
+      const pick = () => { opt.apply(state); renderPackConfirm(opt); };
+      card.addEventListener("click", pick);
+      card.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") pick(); });
+    });
   });
 }
 
@@ -280,7 +420,6 @@ function renderPackConfirm(opt) {
     <button id="continue-btn">${nextLabel}</button>
   `;
   document.getElementById("continue-btn").addEventListener("click", () => {
-    tickRentals(state);
     state.week++;
     if (state.week > WEEKS_TOTAL) {
       if (state.wins >= PLAYOFF_LINE) renderPlayoffIntro();
@@ -300,12 +439,12 @@ function renderPlayoffIntro() {
     ${phaseHeading("Playoffs")}
     <h1>You Clinched a Spot</h1>
     <p>You hit the ${PLAYOFF_LINE}-${WEEKS_TOTAL - PLAYOFF_LINE} playoff line. One game, win or go home. No pack afterward -- this one's just for the record book.</p>
-    <button id="playoff-btn">Play Playoff Game</button>
+    <button id="playoff-btn">See Matchup</button>
   `;
   document.getElementById("playoff-btn").addEventListener("click", () => {
     const field = TEAMS.filter((t) => t.code !== state.identity.code);
     const opponent = field.reduce((strongest, t) => (teamStrength(t) > teamStrength(strongest) ? t : strongest), field[0]);
-    runSim(opponent, true);
+    renderOpponentPreview(opponent, true);
   });
 }
 

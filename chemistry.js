@@ -53,6 +53,12 @@ export function computeChemistry(qb, rb, wr1, te) {
   return Math.round(50 + ratio * 50);
 }
 
+// Quick true/false: does this player's tags complement the QB's style?
+// Used to show a scheme-fit icon on pack cards before you pick.
+export function tagsFitQb(qbTags, playerTags) {
+  return qbTags.some((qbTag) => (COMPAT[qbTag] || []).some((t) => playerTags.includes(t)));
+}
+
 // Small helper for the UI: explain *why* a chemistry score landed where it did.
 export function explainChemistry(qb, rb, wr1, te) {
   const notes = [];
