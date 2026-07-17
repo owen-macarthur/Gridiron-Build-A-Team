@@ -4,9 +4,9 @@
 // all lives in engine.js / chemistry.js / packs.js. If you're tuning
 // numbers, you almost certainly want one of those files instead.
 // -----------------------------------------------------------------------
-import { TEAMS, createDefaultRoster, FREE_AGENTS } from "./data.js";
+import { TEAMS, createDefaultRoster, FREE_AGENTS, OFFENSE_SCHEMES, DEFENSE_SCHEMES } from "./data.js";
 import { computeChemistry, explainChemistry, tagsFitQb, UNIT_LABEL, TAG_TO_UNIT } from "./chemistry.js";
-import { teamStrength, simulateWeek, generatePlayByPlay, computeQbMultiplier, computeFinalScore, effectiveUnitRating } from "./engine.js";
+import { teamStrength, simulateWeek, generatePlayByPlay, computeQbMultiplier, computeFinalScore, effectiveUnitRating, netSchemeAdvantage } from "./engine.js";
 import { generateWinPack, generateLossPack, generateIntroPack, tickRentals } from "./packs.js";
 
 const WEEKS_TOTAL = 8; // Prototype length. Full version target: 17 + playoffs.
@@ -33,9 +33,7 @@ function newGameState(identity, qb, choiceSet) {
 }
 
 function currentChemistry() {
-  const r = state.roster;
-  const topWr = r.wrs.reduce((best, w) => (w.overall > best.overall ? w : best), r.wrs[0]);
-  return computeChemistry(r.qb, r.rb, topWr, r.te);
+  return computeChemistry(state.roster);
 }
 
 function phaseHeading(text) {
@@ -47,11 +45,11 @@ function tagRow(tags) {
   return `<div class="tag-row">${tags.map((t) => `<span class="tag">${t.replace("_", " ")}</span>`).join("")}</div>`;
 }
 
-// Small "games left" pill for a rental-tracked slot, or "" if it's not a rental.
-function rentalBadge(kind, slot, wrIndexOrPlayer) {
-  const r = kind === "skill"
-    ? state.rentals.find((x) => x.kind === "skill" && x.slot === slot && (slot !== "wr" || x.wrIndex === wrIndexOrPlayer))
-    : state.rentals.find((x) => x.kind === "defense" && x.player === wrIndexOrPlayer);
+// Small "games left" pill for a rental-tracked player, or "" if they're
+// not currently a rental. Rentals are tracked by player object reference,
+// so this works the same for a WR, RB, TE, or defender.
+function rentalBadge(player) {
+  const r = state.rentals.find((x) => x.player === player);
   return r ? `<span class="tag">⏳ ${r.gamesLeft} left</span>` : "";
 }
 
@@ -97,7 +95,7 @@ function renderQbSelect() {
     `;
     const choose = () => {
       state = newGameState(team, qb, choices.map((c) => c.qb));
-      renderIntroPack();
+      renderSchemeSelect();
     };
     card.addEventListener("click", choose);
     card.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") choose(); });
@@ -106,27 +104,146 @@ function renderQbSelect() {
 }
 
 // ---------------------------------------------------------------------
-// Screen: Intro Pack -- automatic 2 offense + 2 defense to start the season
+// Screen: Scheme select -- one offense scheme, one defense scheme
+// ---------------------------------------------------------------------
+function schemeUsedByCities(key, field) {
+  return TEAMS.filter((t) => t[field] === key).slice(0, 3).map((t) => t.city).join(", ");
+}
+
+function renderSchemeSelect() {
+  app.innerHTML = `
+    ${phaseHeading("Scheme Room")}
+    <h1>Pick Your Identity</h1>
+    <p>One offensive scheme, one defensive scheme. Matchups matter -- the right scheme against the wrong opponent can steal a win.</p>
+    <h3>Offense</h3>
+    <div class="card-grid" id="off-scheme-grid"></div>
+    <h3 style="margin-top:18px;">Defense</h3>
+    <div class="card-grid" id="def-scheme-grid"></div>
+    <button id="scheme-confirm-btn" style="margin-top:16px; display:none;">Confirm Schemes</button>
+  `;
+
+  let chosenOff = null;
+  let chosenDef = null;
+
+  const offGrid = document.getElementById("off-scheme-grid");
+  Object.entries(OFFENSE_SCHEMES).forEach(([key, scheme]) => {
+    const card = document.createElement("div");
+    card.className = "card selectable";
+    card.tabIndex = 0;
+    card.innerHTML = `
+      <div class="qb-name">${scheme.label}</div>
+      <p>${scheme.bio}</p>
+      <div class="eyebrow">Used by: ${schemeUsedByCities(key, "offenseScheme")}</div>
+    `;
+    const choose = () => {
+      chosenOff = key;
+      [...offGrid.children].forEach((c) => { c.style.outline = ""; });
+      card.style.outline = "3px solid var(--gold)";
+      maybeShowConfirm();
+    };
+    card.addEventListener("click", choose);
+    card.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") choose(); });
+    offGrid.appendChild(card);
+  });
+
+  const defGrid = document.getElementById("def-scheme-grid");
+  Object.entries(DEFENSE_SCHEMES).forEach(([key, scheme]) => {
+    const card = document.createElement("div");
+    card.className = "card selectable";
+    card.tabIndex = 0;
+    card.innerHTML = `
+      <div class="qb-name">${scheme.label}</div>
+      <p>${scheme.bio}</p>
+      <div class="eyebrow">Used by: ${schemeUsedByCities(key, "defenseScheme")}</div>
+    `;
+    const choose = () => {
+      chosenDef = key;
+      [...defGrid.children].forEach((c) => { c.style.outline = ""; });
+      card.style.outline = "3px solid var(--gold)";
+      maybeShowConfirm();
+    };
+    card.addEventListener("click", choose);
+    card.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") choose(); });
+    defGrid.appendChild(card);
+  });
+
+  function maybeShowConfirm() {
+    const btn = document.getElementById("scheme-confirm-btn");
+    if (chosenOff && chosenDef) {
+      btn.style.display = "";
+      btn.onclick = () => {
+        state.roster.offenseScheme = chosenOff;
+        state.roster.defenseScheme = chosenDef;
+        renderIntroPack();
+      };
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// Screen: Intro Pack -- fantasy pack: choose 2 of 3 offense, 2 of 3 defense
 // ---------------------------------------------------------------------
 function renderIntroPack() {
-  const picks = generateIntroPack(state.ownedPlayers);
+  const { offense, defense } = generateIntroPack(state.ownedPlayers);
+  const selectedOffense = new Set();
+  const selectedDefense = new Set();
 
   app.innerHTML = `
     ${phaseHeading("Intro Pack")}
-    <h1>Your Starting Reinforcements</h1>
-    <p>Before Week 1, you get a baseline: 2 offensive and 2 defensive players, yours for the season.</p>
-    <div class="card-grid" id="intro-grid"></div>
-    <button id="intro-continue-btn" style="margin-top:16px; display:none;">Continue to Week 1</button>
+    <h1>Fantasy Pack</h1>
+    <p>Pick 2 of these 3 offensive players, and 2 of these 3 defensive players. Yours for the season.</p>
+    <h3>Offense -- choose 2 of 3</h3>
+    <div class="card-grid" id="intro-off-grid"></div>
+    <h3 style="margin-top:18px;">Defense -- choose 2 of 3</h3>
+    <div class="card-grid" id="intro-def-grid"></div>
+    <button id="intro-confirm-btn" style="margin-top:16px; display:none;">Confirm Picks</button>
   `;
 
-  const grid = document.getElementById("intro-grid");
-  picks.forEach((opt) => grid.appendChild(buildSpinCard(opt)));
+  const offGrid = document.getElementById("intro-off-grid");
+  const defGrid = document.getElementById("intro-def-grid");
+  offense.forEach((opt) => offGrid.appendChild(buildSpinCard(opt)));
+  defense.forEach((opt) => defGrid.appendChild(buildSpinCard(opt)));
 
-  spinAll(picks, () => {
-    picks.forEach((opt) => opt.apply(state));
-    const btn = document.getElementById("intro-continue-btn");
-    btn.style.display = "";
-    btn.addEventListener("click", renderTeamReveal);
+  spinAll([...offense, ...defense], () => {
+    wireToggleGroup(offense, selectedOffense, 2, maybeShowIntroConfirm);
+    wireToggleGroup(defense, selectedDefense, 2, maybeShowIntroConfirm);
+  });
+
+  function maybeShowIntroConfirm() {
+    const btn = document.getElementById("intro-confirm-btn");
+    if (selectedOffense.size === 2 && selectedDefense.size === 2) {
+      btn.style.display = "";
+      btn.onclick = () => {
+        offense.filter((o) => selectedOffense.has(o.id)).forEach((o) => o.apply(state));
+        defense.filter((o) => selectedDefense.has(o.id)).forEach((o) => o.apply(state));
+        renderTeamReveal();
+      };
+    } else {
+      btn.style.display = "none";
+    }
+  }
+}
+
+// Wires click-to-toggle selection (max `limit` picks) across a group of
+// pack option cards, using an outline as the "selected" indicator.
+function wireToggleGroup(options, selectedSet, limit, onChange) {
+  options.forEach((opt) => {
+    const card = app.querySelector(`.pack-option[data-id="${opt.id}"]`);
+    card.style.pointerEvents = "";
+    card.classList.add("selectable");
+    card.tabIndex = 0;
+    const toggle = () => {
+      if (selectedSet.has(opt.id)) {
+        selectedSet.delete(opt.id);
+        card.style.outline = "";
+      } else if (selectedSet.size < limit) {
+        selectedSet.add(opt.id);
+        card.style.outline = "3px solid var(--gold)";
+      }
+      onChange();
+    };
+    card.addEventListener("click", toggle);
+    card.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") toggle(); });
   });
 }
 
@@ -137,32 +254,36 @@ function buildSpinCard(opt) {
   const card = document.createElement("div");
   card.className = "card pack-option";
   card.setAttribute("data-id", opt.id);
+  const isNamedReveal = opt.player && opt.title === opt.player.name;
   card.innerHTML = `
-    <h3>${opt.title === opt.player?.name ? "New Player" : opt.title}</h3>
+    <h3>${isNamedReveal ? "New Player" : opt.title}</h3>
     <div class="spin-name qb-name">? ? ?</div>
     <div class="pack-reveal" style="display:none;"></div>
   `;
   return card;
 }
 
-// Cycles each card's name through random candidates from the same tier as
-// the real pick, then locks in on the true result. Selection is disabled
-// on a card until its spin finishes.
+// Cycles each card's name through random candidates at the same position
+// as the real pick, then locks in on the true result.
 function spinAll(options, onAllDone) {
   let remaining = options.length;
+  function finishSpin() {
+    remaining--;
+    if (remaining === 0) onAllDone();
+  }
+
   options.forEach((opt) => {
     const card = app.querySelector(`.pack-option[data-id="${opt.id}"]`);
     const nameEl = card.querySelector(".spin-name");
 
     if (!opt.player) {
-      // Unit upgrades aren't a "player pull" -- reveal immediately, no spin.
       finishSpin();
       return;
     }
 
     const candidates = [
       ...FREE_AGENTS.superstar, ...FREE_AGENTS.great, ...FREE_AGENTS.solid, ...FREE_AGENTS.depth,
-    ].filter((p) => p.pos === opt.player.pos || p.name === opt.player.name);
+    ].filter((p) => p.pos === opt.player.pos);
     const namesToSpin = candidates.length ? candidates : [opt.player];
 
     let ticks = 0;
@@ -177,11 +298,6 @@ function spinAll(options, onAllDone) {
       }
     }, 70);
   });
-
-  function finishSpin() {
-    remaining--;
-    if (remaining === 0) onAllDone();
-  }
 
   // Reveal each card's detail content once its own spin lands.
   options.forEach((opt) => {
@@ -199,7 +315,6 @@ function spinAll(options, onAllDone) {
           ${fit ? `<span class="tag">✓ Scheme Fit</span>` : ""}
         `;
         reveal.style.display = "";
-        if (!opt.player) nameEl.parentElement.querySelector(".spin-name")?.remove?.();
       }
     }, 80);
   });
@@ -211,8 +326,7 @@ function spinAll(options, onAllDone) {
 function renderTeamReveal() {
   const r = state.roster;
   const chemistry = currentChemistry();
-  const topWr = r.wrs.reduce((best, w) => (w.overall > best.overall ? w : best), r.wrs[0]);
-  const notes = explainChemistry(r.qb, r.rb, topWr, r.te);
+  const notes = explainChemistry(r);
 
   const defenseByUnit = { DL: [], LB: [], Secondary: [] };
   r.defensePlayers.forEach((p) => {
@@ -226,7 +340,7 @@ function renderTeamReveal() {
     return `
       <div class="roster-row"><span class="roster-role">${unitKey}</span><span>${UNIT_LABEL[unitKey]}</span><span class="overall-pill">${rating}</span></div>
       ${players.map((p) => `
-        <div class="roster-row" style="padding-left:16px;"><span class="roster-role">${p.pos}</span><span>${p.name}${tagRow(p.tags)}${rentalBadge("defense", null, p)}</span><span class="overall-pill">${p.overall}</span></div>
+        <div class="roster-row" style="padding-left:16px;"><span class="roster-role">${p.pos}</span><span>${p.name}${tagRow(p.tags)}${rentalBadge(p)}</span><span class="overall-pill">${p.overall}</span></div>
       `).join("")}
     `;
   };
@@ -236,6 +350,10 @@ function renderTeamReveal() {
     ${phaseHeading(`Regular Season &middot; Week ${state.week}/${WEEKS_TOTAL}`)}
     <h1>${state.identity.city} ${state.identity.name}</h1>
     <div class="multiplier-badge"><span>Score Multiplier</span><span class="num">&times;${state.qbMultiplier.toFixed(2)}</span></div>
+    <div class="tag-row">
+      <span class="tag">${OFFENSE_SCHEMES[r.offenseScheme]?.label || r.offenseScheme}</span>
+      <span class="tag">${DEFENSE_SCHEMES[r.defenseScheme]?.label || r.defenseScheme}</span>
+    </div>
 
     <div class="card" style="margin-top:18px;">
       <h2>Chemistry: ${chemistry}/100</h2>
@@ -245,9 +363,9 @@ function renderTeamReveal() {
     <div class="card">
       <h3>Offense</h3>
       <div class="roster-row"><span class="roster-role">QB</span><span>${r.qb.name}${tagRow(r.qb.tags)}</span><span class="overall-pill">${r.qb.overall}</span></div>
-      <div class="roster-row"><span class="roster-role">RB</span><span>${r.rb.name}${tagRow(r.rb.tags)}${rentalBadge("skill", "rb")}</span><span class="overall-pill">${r.rb.overall}</span></div>
-      ${r.wrs.map((w, i) => `<div class="roster-row"><span class="roster-role">WR${i + 1}</span><span>${w.name}${tagRow(w.tags)}${rentalBadge("skill", "wr", i)}</span><span class="overall-pill">${w.overall}</span></div>`).join("")}
-      <div class="roster-row"><span class="roster-role">TE</span><span>${r.te.name}${tagRow(r.te.tags)}${rentalBadge("skill", "te")}</span><span class="overall-pill">${r.te.overall}</span></div>
+      <div class="roster-row"><span class="roster-role">RB</span><span>${r.rb.name}${tagRow(r.rb.tags)}${rentalBadge(r.rb)}</span><span class="overall-pill">${r.rb.overall}</span></div>
+      ${r.wrs.map((w, i) => `<div class="roster-row"><span class="roster-role">WR${i + 1}</span><span>${w.name}${tagRow(w.tags)}${rentalBadge(w)}</span><span class="overall-pill">${w.overall}</span></div>`).join("")}
+      <div class="roster-row"><span class="roster-role">TE</span><span>${r.te.name}${tagRow(r.te.tags)}${rentalBadge(r.te)}</span><span class="overall-pill">${r.te.overall}</span></div>
       <div class="roster-row"><span class="roster-role">OL</span><span>${UNIT_LABEL.OL}</span><span class="overall-pill">${r.units.OL}</span></div>
     </div>
 
@@ -274,6 +392,13 @@ function strengthTier(strength) {
   return "Rebuilding";
 }
 
+function schemeEdgeLabel(roster, opponent) {
+  const adv = netSchemeAdvantage(roster, opponent);
+  if (adv > 0) return "Favorable matchup";
+  if (adv < 0) return "Tough matchup";
+  return "Even matchup";
+}
+
 function renderOpponentPreview(opponent, isPlayoff) {
   const strength = teamStrength(opponent);
   app.innerHTML = `
@@ -283,6 +408,7 @@ function renderOpponentPreview(opponent, isPlayoff) {
     <div class="card">
       <div class="roster-row"><span class="roster-role">TIER</span><span>${strengthTier(strength)}</span><span class="overall-pill">${Math.round(strength)}</span></div>
       <div class="roster-row"><span class="roster-role">QB</span><span>${opponent.qb.name}${tagRow(opponent.qb.tags)}</span><span class="overall-pill">${opponent.qb.overall}</span></div>
+      <div class="roster-row"><span class="roster-role">SCHEME</span><span>${schemeEdgeLabel(state.roster, opponent)}</span><span></span></div>
     </div>
     <button id="kickoff-btn">Kickoff</button>
   `;

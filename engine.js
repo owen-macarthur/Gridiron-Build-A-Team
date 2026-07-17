@@ -6,9 +6,11 @@
 //
 // Two different "shapes" pass through here:
 //   - a user ROSTER (from data.js createDefaultRoster): has .units and
-//     .defensePlayers, gets upgraded via packs.
+//     .defensePlayers, gets upgraded via packs, and carries its own
+//     .offenseScheme/.defenseScheme.
 //   - a real opponent TEAM (from data.js TEAMS): has a fixed .defense
-//     array of tagged impact players, no .units.
+//     array of tagged impact players, no .units, and its own
+//     .offenseScheme/.defenseScheme.
 // The helpers below normalize both into the same profile shape so
 // strength/grading math doesn't need to branch everywhere.
 // -----------------------------------------------------------------------
@@ -27,6 +29,10 @@ function avgOr(list, fallback) {
 
 function rand(spread) {
   return (Math.random() - 0.5) * spread;
+}
+
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 // A unit's rating, including any impact defenders assigned to it via packs.
@@ -56,7 +62,10 @@ function getDefenseProfile(entity) {
   };
 }
 
-// Weighted overall for a full team/roster -- the core "how good are you" number.
+// Weighted overall for a full team/roster -- the core "how good are you"
+// number. Deliberately scheme-independent -- schemes affect win
+// probability separately (see netSchemeAdvantage) so this number stays a
+// stable "how talented is this roster" reading.
 export function teamStrength(entity) {
   const wrAvg = entity.wrs.reduce((s, p) => s + p.overall, 0) / entity.wrs.length;
   const ol = entity.units ? entity.units.OL : OPPONENT_OL;
@@ -75,9 +84,44 @@ export function teamStrength(entity) {
   );
 }
 
-// The core "did you win" roll. Strength difference + chemistry + randomness.
+// -----------------------------------------------------------------------
+// Scheme matchups. Each defense scheme has offense schemes it counters
+// (strongVs) and offense schemes that counter it (weakVs). This is what
+// lets a worse roster still catch an upset-friendly matchup.
+// -----------------------------------------------------------------------
+const SCHEME_SWING = 4;
+
+const DEFENSE_COUNTERS = {
+  "Blitz Heavy": { strongVs: ["Ground & Pound", "Air Raid"], weakVs: ["Option/RPO", "West Coast"] },
+  "Cover 2": { strongVs: ["Air Raid"], weakVs: ["West Coast"] },
+  "Man-to-Man": { strongVs: ["West Coast", "Air Raid"], weakVs: ["Option/RPO", "Ground & Pound"] },
+  "8-in-the-Box": { strongVs: ["Ground & Pound"], weakVs: ["Air Raid", "West Coast"] },
+};
+
+// Positive = the offense wins this matchup, negative = the defense wins
+// it, 0 = neutral pairing.
+export function schemeEdge(offenseScheme, defenseScheme) {
+  const counters = DEFENSE_COUNTERS[defenseScheme];
+  if (!counters) return 0;
+  if (counters.strongVs.includes(offenseScheme)) return -SCHEME_SWING;
+  if (counters.weakVs.includes(offenseScheme)) return SCHEME_SWING;
+  return 0;
+}
+
+// Net scheme advantage for the user's roster in this matchup: their
+// offense vs the opponent's defense, minus the opponent's offense vs
+// their defense. Added directly into the strength diff before the win
+// roll -- a positive number favors the user regardless of raw talent.
+export function netSchemeAdvantage(roster, oppTeam) {
+  if (!roster.offenseScheme || !roster.defenseScheme) return 0;
+  return schemeEdge(roster.offenseScheme, oppTeam.defenseScheme) - schemeEdge(oppTeam.offenseScheme, roster.defenseScheme);
+}
+
+// The core "did you win" roll. Strength difference + chemistry + scheme
+// matchup + randomness.
 export function simulateWeek(roster, oppTeam, chemistry) {
-  const userStrength = teamStrength(roster) + (chemistry - 50) * 0.25;
+  const schemeAdv = netSchemeAdvantage(roster, oppTeam);
+  const userStrength = teamStrength(roster) + (chemistry - 50) * 0.25 + schemeAdv;
   const oppStrength = teamStrength(oppTeam);
   const diff = userStrength - oppStrength;
 
@@ -131,24 +175,76 @@ function generateScoreline(won, diff) {
   return { userScore: Math.max(userScore, 3), oppScore: Math.max(oppScore, 3) };
 }
 
+// -----------------------------------------------------------------------
+// Fake stat lines: only generated for a standout performance (grade >= 4)
+// in a category, and only when there's an actual named player to credit
+// -- never fabricated for a default/unnamed unit.
+// -----------------------------------------------------------------------
+function fakeStatLine(kind, player, grade) {
+  const great = grade === 5;
+  switch (kind) {
+    case "pass": {
+      const att = randInt(26, 34);
+      const comp = Math.min(att, randInt(18, 25) + (great ? 3 : 0));
+      const yards = randInt(230, 310) + (great ? 40 : 0);
+      const tds = randInt(2, great ? 4 : 3);
+      return `${player.name}: ${comp}/${att}, ${yards} yds, ${tds} TD`;
+    }
+    case "rush": {
+      const carries = randInt(14, 22);
+      const yards = randInt(70, 130) + (great ? 35 : 0);
+      const tds = randInt(0, great ? 2 : 1);
+      return `${player.name}: ${carries} car, ${yards} yds, ${tds} TD`;
+    }
+    case "pass_defense": {
+      const pbu = randInt(1, 3);
+      const pick = great ? randInt(1, 2) : (Math.random() < 0.3 ? 1 : 0);
+      return `${player.name}: ${pbu} PBU${pick ? `, ${pick} INT` : ""}`;
+    }
+    case "run_defense": {
+      const tackles = randInt(6, 11) + (great ? 2 : 0);
+      const tfl = randInt(0, great ? 3 : 2);
+      return `${player.name}: ${tackles} tkl${tfl ? `, ${tfl} TFL` : ""}`;
+    }
+    default:
+      return "";
+  }
+}
+
 // Simple scripted-feeling ticker lines -- text lines that reveal one at a
-// time (the "easiest for now" version). Swap this out later for the
-// fancier animated version without touching anything else.
+// time (the "easiest for now" version). Adds a fake stat line for a named
+// player whenever their category graded well.
 export function generatePlayByPlay(userCity, oppCity, roster, grades, won, userScore, oppScore) {
   const lines = [];
   lines.push(`Kickoff: ${userCity} vs ${oppCity}`);
 
-  if (grades["Pass Game"] >= 4) lines.push(`${roster.qb.name} is slicing this defense up through the air.`);
-  else if (grades["Pass Game"] <= 2) lines.push(`${roster.qb.name} is under siege -- the passing game can't find a rhythm.`);
+  if (grades["Pass Game"] >= 4) {
+    lines.push(`${roster.qb.name} is slicing this defense up through the air.`);
+    lines.push(fakeStatLine("pass", roster.qb, grades["Pass Game"]));
+  } else if (grades["Pass Game"] <= 2) {
+    lines.push(`${roster.qb.name} is under siege -- the passing game can't find a rhythm.`);
+  }
 
-  if (grades["Run Game"] >= 4) lines.push(`${roster.rb.name} is breaking off chunk runs all afternoon.`);
-  else if (grades["Run Game"] <= 2) lines.push(`${roster.rb.name} can't find a crease -- the run game stalls.`);
+  if (grades["Run Game"] >= 4) {
+    lines.push(`${roster.rb.name} is breaking off chunk runs all afternoon.`);
+    lines.push(fakeStatLine("rush", roster.rb, grades["Run Game"]));
+  } else if (grades["Run Game"] <= 2) {
+    lines.push(`${roster.rb.name} can't find a crease -- the run game stalls.`);
+  }
 
   if (grades["Turnover Battle"] <= 2) lines.push(`Costly turnover for ${userCity} -- ${oppCity} capitalizes.`);
   else if (grades["Turnover Battle"] >= 4) lines.push(`${userCity}'s defense forces a turnover at a huge moment.`);
 
-  if (grades["Pass Defense"] >= 4) lines.push(`The secondary is locking receivers down -- ${oppCity}'s passing attack is stuck.`);
-  if (grades["Run Defense"] >= 4) lines.push(`The front seven is stuffing every run ${oppCity} tries.`);
+  if (grades["Pass Defense"] >= 4) {
+    lines.push(`The secondary is locking receivers down -- ${oppCity}'s passing attack is stuck.`);
+    const defender = roster.defensePlayers.find((p) => p.tags.includes("coverage") || p.tags.includes("pass_rush"));
+    if (defender) lines.push(fakeStatLine("pass_defense", defender, grades["Pass Defense"]));
+  }
+  if (grades["Run Defense"] >= 4) {
+    lines.push(`The front seven is stuffing every run ${oppCity} tries.`);
+    const defender = roster.defensePlayers.find((p) => p.tags.includes("run_stopper"));
+    if (defender) lines.push(fakeStatLine("run_defense", defender, grades["Run Defense"]));
+  }
   if (grades["2-Minute Offense"] >= 4) lines.push(`Clutch two-minute drive from ${roster.qb.name} before the half.`);
 
   lines.push(`FINAL: ${userCity} ${userScore} -- ${oppCity} ${oppScore}`);
@@ -168,8 +264,7 @@ export function computeQbMultiplier(chosenQb, choiceSet) {
 }
 
 // A single number describing how good your final roster is, on roughly
-// the same 0-99 scale as player overalls. Used by computeFinalScore below,
-// and handy to display on its own ("Ending Overall: X").
+// the same 0-99 scale as player overalls.
 export function rosterOverallRating(roster) {
   const wrAvg = roster.wrs.reduce((s, p) => s + p.overall, 0) / roster.wrs.length;
   const unitAvg = ["OL", "DL", "LB", "Secondary", "ST"]
@@ -178,18 +273,14 @@ export function rosterOverallRating(roster) {
   return (roster.qb.overall + roster.rb.overall + wrAvg + roster.te.overall + unitAvg) / 5;
 }
 
-// The final season score: how well did you actually do, given what you
-// had to work with? Combines four things the player asked for --
-//   - record            (up to 50 pts)
-//   - ending roster overall (up to 30 pts) -- rewards actually building a team
-//   - ending chemistry      (up to 20 pts) -- rewards good pairings, not just talent
-// ...then multiplies the total by your QB multiplier, so drafting a lower
-// QB and still performing well pays off exactly like the original pitch:
-// "did a lot with less."
+// The final season score: record (up to 50 pts) + ending roster overall
+// (up to 30 pts) + ending chemistry (up to 20 pts), all multiplied by the
+// QB multiplier -- "did a lot with less" pays off exactly like the
+// original pitch.
 export function computeFinalScore(wins, losses, roster, chemistry, qbMultiplier) {
   const winPct = wins / Math.max(1, wins + losses);
   const rosterOverall = rosterOverallRating(roster);
-  const rosterFactor = Math.min(1, Math.max(0, (rosterOverall - 60) / 39)); // 60 (all-default) -> 0, 99 -> 1
+  const rosterFactor = Math.min(1, Math.max(0, (rosterOverall - 60) / 39));
   const chemFactor = chemistry / 100;
 
   const recordPts = winPct * 50;
@@ -207,29 +298,10 @@ export function computeFinalScore(wins, losses, roster, chemistry, qbMultiplier)
 }
 
 function toFinalLetterGrade(score) {
-  // rawScore tops out at 100, then gets multiplied by up to ~1.5x for a
-  // heavy-underdog QB pick -- so a max realistic score is around 140-150.
   if (score >= 130) return "S";
   if (score >= 105) return "A";
   if (score >= 80) return "B";
   if (score >= 55) return "C";
   if (score >= 35) return "D";
-  return "F";
-}
-
-// Final grade/score for the season, factoring in the QB multiplier.
-export function computeSeasonScore(wins, losses, avgGradeTotal, qbMultiplier) {
-  const winPct = wins / Math.max(1, wins + losses);
-  const base = winPct * 60 + (avgGradeTotal / 35) * 40; // avgGradeTotal out of 7 cats * 5 max = 35
-  const finalScore = Math.round(base * qbMultiplier);
-  return { finalScore, letter: toLetterGrade(finalScore) };
-}
-
-function toLetterGrade(score) {
-  if (score >= 95) return "S";
-  if (score >= 85) return "A";
-  if (score >= 70) return "B";
-  if (score >= 55) return "C";
-  if (score >= 40) return "D";
   return "F";
 }

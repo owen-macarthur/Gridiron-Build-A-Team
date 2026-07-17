@@ -4,30 +4,29 @@
 // FREE_AGENTS). Skill players (RB/WR/TE) slot directly into the roster;
 // defensive players join a specific unit and boost it.
 //
-// Randomness + no-repeats: pickPlayer() first picks a broad category
-// (WR/RB/TE/DEF) with equal odds, then a random player within it. This
-// matters because the tiers don't have equal counts per position (the
-// superstar tier alone is 10 defenders vs 3 TEs) -- picking a flat random
-// index over the whole array would make whichever category has the most
-// entries show up far more often than the others. Category-first picking
-// keeps the four groups feeling equally likely regardless of pool shape,
-// and also regardless of how the pool has been thinned out by ownership.
+// WR ordering: after any WR change, roster.wrs is re-sorted descending by
+// overall, so "WR1" always means "your best receiver" regardless of which
+// slot happened to get overwritten.
 //
-// pickPlayer() also excludes anyone in `owned` (every player you've ever
-// acquired) so you never get offered the same player twice, and within a
-// single pack call, already-offered players are excluded too.
+// Rental tracking is by player OBJECT REFERENCE, not array index or slot
+// name. This matters because WR sorting can shuffle indices around --
+// index-based tracking would revert the wrong slot after a sort. Storing
+// the actual player reference means tickRentals() can always find where
+// that specific player currently lives (or confirm they're already gone)
+// regardless of how the array has been reordered.
 //
 // Slot integrity: slotSkillPlayer() clears out any rental still tracking
-// the slot it's about to overwrite (see clearSlotRentals). Without this,
-// an old rental for the same slot could later expire and revert the slot
-// back to a stale snapshot, wiping out whatever's there now -- including
-// a player you were told was yours for the whole season.
+// the exact player object about to be displaced, so an old rental can't
+// later fire and revert to a stale snapshot.
 //
-// Rentals (gamesLeft set) are tracked in state.rentals and reverted by
-// tickRentals() once their games run out. tickRentals() should only be
-// called once per week, at the moment a game is actually simulated (see
-// script.js runSim) -- NOT right after a pack is confirmed, or a rental
-// loses a game it was never actually used for.
+// Category-weighted picking: pickPlayer() picks a broad category
+// (WR/RB/TE/DEF) with equal odds first, then a player within it, so the
+// four groups feel equally likely regardless of pool shape or how much
+// of the pool you've already owned.
+//
+// tickRentals() should only be called once per week, at the moment a game
+// is actually simulated (see script.js runSim) -- not right after a pack
+// is confirmed, or a rental loses a game it was never used for.
 // -----------------------------------------------------------------------
 import { FREE_AGENTS } from "./data.js";
 import { TAG_TO_UNIT, UNIT_LABEL } from "./chemistry.js";
@@ -46,15 +45,14 @@ function isDefensivePlayer(player) {
   return !!TAG_TO_UNIT[player.tags[0]];
 }
 
-// Broad category used for even-odds picking and for Intro Pack variety:
-// "WR" | "RB" | "TE" | "DEF"
 function categoryOf(player) {
-  return isDefensivePlayer(player) ? "DEF" : player.pos;
+  return isDefensivePlayer(player) ? "DEF" : player.pos; // "WR" | "RB" | "TE" | "DEF"
 }
 
-// Picks a random category first (equal odds), then a random player within
-// it. Excludes names in `excludeSet`; falls back to the full tier if
-// everyone available has already been excluded.
+function sortWrsDescending(roster) {
+  roster.wrs.sort((a, b) => b.overall - a.overall);
+}
+
 function pickPlayer(tier, excludeSet) {
   const available = FREE_AGENTS[tier].filter((p) => !excludeSet.has(p.name));
   const pool = available.length ? available : FREE_AGENTS[tier];
@@ -64,63 +62,45 @@ function pickPlayer(tier, excludeSet) {
   return withinCategory[Math.floor(Math.random() * withinCategory.length)];
 }
 
-// Like pickPlayer, but picks N players guaranteed to be in different
-// categories (used for the Intro Pack's "2 offense, 2 defense" spread).
-function pickDistinctCategories(pool, n, excludeSet) {
-  const localExclude = new Set(excludeSet);
-  const shuffled = [...pool].sort(() => Math.random() - 0.5);
-  const picks = [];
-  const usedCategories = new Set();
-  for (const p of shuffled) {
-    if (picks.length >= n) break;
-    if (localExclude.has(p.name)) continue;
-    const cat = categoryOf(p);
-    if (usedCategories.has(cat)) continue;
-    picks.push(p);
-    usedCategories.add(cat);
-    localExclude.add(p.name);
-  }
-  // Fallback if the pool didn't have enough distinct categories left.
-  for (const p of shuffled) {
-    if (picks.length >= n) break;
-    if (picks.includes(p) || localExclude.has(p.name)) continue;
-    picks.push(p);
-    localExclude.add(p.name);
-  }
-  return picks;
+// Picks exactly one player of the given position (RB/WR/TE), excluding
+// already-owned/excluded names. Used by the Intro Pack, which always
+// offers exactly one of each position (not a random category draw).
+function pickOnePosition(pool, pos, excludeSet) {
+  const candidates = pool.filter((p) => p.pos === pos && !excludeSet.has(p.name));
+  const fallback = pool.filter((p) => p.pos === pos);
+  const list = candidates.length ? candidates : fallback;
+  return list[Math.floor(Math.random() * list.length)];
 }
 
-// Removes any rental still tracking the slot about to be overwritten, so
-// it can't fire a stale revert later and clobber whatever's slotted in now.
-function clearSlotRentals(state, slot, wrIndex) {
-  state.rentals = state.rentals.filter((r) => {
-    if (r.kind !== "skill" || r.slot !== slot) return true;
-    if (slot === "wr" && r.wrIndex !== wrIndex) return true;
-    return false;
-  });
+// Removes any rental still tracking this exact player object, so it can't
+// fire a stale revert later after the player's been displaced.
+function clearRentalTrackingFor(state, outgoingPlayer) {
+  state.rentals = state.rentals.filter((r) => r.player !== outgoingPlayer);
 }
 
-// Replaces the RB/TE outright, or the weakest current WR (by overall).
+// Replaces the RB/TE outright, or the weakest current WR (by overall),
+// then re-sorts WRs so WR1 is always the best of the three.
 function slotSkillPlayer(state, player) {
   const roster = state.roster;
   if (player.pos === "RB") {
-    clearSlotRentals(state, "rb");
     const previous = roster.rb;
+    clearRentalTrackingFor(state, previous);
     roster.rb = player;
     return { slot: "rb", previous };
   }
   if (player.pos === "TE") {
-    clearSlotRentals(state, "te");
     const previous = roster.te;
+    clearRentalTrackingFor(state, previous);
     roster.te = player;
     return { slot: "te", previous };
   }
   let weakestIdx = 0;
   roster.wrs.forEach((w, i) => { if (w.overall < roster.wrs[weakestIdx].overall) weakestIdx = i; });
-  clearSlotRentals(state, "wr", weakestIdx);
   const previous = roster.wrs[weakestIdx];
+  clearRentalTrackingFor(state, previous);
   roster.wrs[weakestIdx] = player;
-  return { slot: "wr", wrIndex: weakestIdx, previous };
+  sortWrsDescending(roster);
+  return { slot: "wr", previous };
 }
 
 function applyUnitUpgrade(state, unit, amount) {
@@ -150,17 +130,17 @@ function playerOption(id, title, player, gamesLeft) {
         if (gamesLeft) state.rentals.push({ kind: "defense", player, gamesLeft });
       } else {
         const slotInfo = slotSkillPlayer(state, player);
-        if (gamesLeft) state.rentals.push({ kind: "skill", gamesLeft, ...slotInfo });
+        if (gamesLeft) state.rentals.push({ kind: "skill", player, gamesLeft, ...slotInfo });
       }
     },
   };
 }
 
-function unitOption(id, roster, amount) {
+function unitOption(id, title, roster, amount) {
   const unit = weakestUnit(roster);
   return {
     id,
-    title: `${UNIT_LABEL[unit]} Upgrade`,
+    title: title || `${UNIT_LABEL[unit]} Upgrade`,
     player: null,
     description: `A coaching/depth boost to your ${UNIT_LABEL[unit]} unit (currently your weakest group) for the rest of the season. +${amount} rating.`,
     apply: (state) => applyUnitUpgrade(state, unit, amount),
@@ -180,7 +160,7 @@ export function generateWinPack(streak, roster, ownedPlayers) {
   const options = [
     playerOption("rental", "Star Rental", rentalPlayer, 2),
     playerOption("solid_season", "Solid Starter (Season)", seasonPlayer, null),
-    unitOption("group_upgrade", roster, 6),
+    unitOption("group_upgrade", null, roster, 10),
   ];
 
   if (streak > 0 && streak % 3 === 0) {
@@ -193,49 +173,57 @@ export function generateWinPack(streak, roster, ownedPlayers) {
   return options;
 }
 
+// No more rentals in the loss pack -- a season-long unit boost (smaller
+// than the win-pack version) instead, plus a season-long depth player.
 export function generateLossPack(roster, ownedPlayers) {
   const exclude = new Set(ownedPlayers);
-
-  const tempPlayer = pickPlayer("solid", exclude);
-  exclude.add(tempPlayer.name);
   const seasonPlayer = pickPlayer("depth", exclude);
-  exclude.add(seasonPlayer.name);
 
   return [
-    playerOption("temp_solid", "Solid Player (Temporary)", tempPlayer, 4),
+    unitOption("unit_boost", null, roster, 6),
     playerOption("season_meh", "Depth Piece (Season)", seasonPlayer, null),
   ];
 }
 
-// One-time pre-season pack: 2 offensive + 2 defensive players, all
-// season-long (no rentals), so you're not starting Week 1 with an
-// entirely default roster. Pulled from the "solid" tier -- good enough to
-// matter, not so good it undercuts the whole "build from nothing" pitch.
+// Pre-season "fantasy pack": exactly one RB, one WR, one TE offered on the
+// offensive side (pick 2 of 3), and one DL/LB/Secondary defender each on
+// the defensive side (pick 2 of 3). All season-long. Pulled from the
+// "solid" tier -- good enough to matter, not so good it undercuts the
+// "build from nothing" pitch.
 export function generateIntroPack(ownedPlayers) {
   const exclude = new Set(ownedPlayers);
   const offensePool = FREE_AGENTS.solid.filter((p) => !isDefensivePlayer(p));
   const defensePool = FREE_AGENTS.solid.filter((p) => isDefensivePlayer(p));
 
-  const offensePicks = pickDistinctCategories(offensePool, 2, exclude);
-  offensePicks.forEach((p) => exclude.add(p.name));
-  const defensePicks = pickDistinctCategories(defensePool, 2, exclude);
+  const rb = pickOnePosition(offensePool, "RB", exclude); exclude.add(rb.name);
+  const wr = pickOnePosition(offensePool, "WR", exclude); exclude.add(wr.name);
+  const te = pickOnePosition(offensePool, "TE", exclude); exclude.add(te.name);
 
-  return [...offensePicks, ...defensePicks].map((player) =>
-    playerOption(`intro_${player.name}`, player.name, player, null)
-  );
+  const offense = [rb, wr, te].map((p) => playerOption(`intro_${p.name}`, p.name, p, null));
+  const defense = defensePool.map((p) => playerOption(`intro_${p.name}`, p.name, p, null));
+
+  return { offense, defense };
 }
 
 // Call once per week, at the moment a game is actually simulated, to tick
-// down rentals and revert any that just expired.
+// down rentals and revert any that just expired. Finds the current
+// location of the rental's player by reference (not a stale index), so
+// it stays correct even after WR sorting has shuffled the array.
 export function tickRentals(state) {
   state.rentals = state.rentals.filter((r) => {
     r.gamesLeft -= 1;
     if (r.gamesLeft > 0) return true;
 
     if (r.kind === "skill") {
-      if (r.slot === "rb") state.roster.rb = r.previous;
-      else if (r.slot === "te") state.roster.te = r.previous;
-      else if (r.slot === "wr") state.roster.wrs[r.wrIndex] = r.previous;
+      if (r.slot === "rb" && state.roster.rb === r.player) state.roster.rb = r.previous;
+      else if (r.slot === "te" && state.roster.te === r.player) state.roster.te = r.previous;
+      else if (r.slot === "wr") {
+        const idx = state.roster.wrs.indexOf(r.player);
+        if (idx !== -1) {
+          state.roster.wrs[idx] = r.previous;
+          sortWrsDescending(state.roster);
+        }
+      }
     } else if (r.kind === "defense") {
       state.roster.defensePlayers = state.roster.defensePlayers.filter((p) => p !== r.player);
     }

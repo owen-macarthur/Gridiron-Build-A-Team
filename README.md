@@ -4,7 +4,58 @@ An NFL-flavored season game: draft a QB (a *worse* QB earns a bigger score
 multiplier), build chemistry around him, sim your games, and cash in win/loss
 packs to grow your roster.
 
-## What's new in this update (v4)
+## What's new in this update (v5)
+
+- **Team schemes**: pick one offensive scheme (West Coast / Ground & Pound
+  / Air Raid / Option-RPO) and one defensive scheme (Blitz Heavy / Cover 2
+  / Man-to-Man / 8-in-the-Box) right after drafting your QB, before the
+  Intro Pack. Every opponent has its own scheme pair too (`data.js`), and
+  matchups create a real win-probability swing (`engine.js`
+  `schemeEdge`/`netSchemeAdvantage`) -- a weaker roster in a favorable
+  matchup can still steal a win. The scouting report screen now shows a
+  one-line matchup read ("Favorable" / "Even" / "Tough") before kickoff.
+- **Intro Pack is now a fantasy pack**: exactly one RB, one WR, one TE
+  offered on offense (pick 2 of 3), and one D-Line/Linebacker/Secondary
+  defender offered on defense (pick 2 of 3) -- a real choice instead of a
+  random grant.
+- **Chemistry expanded**: a true slot receiver now always helps (flat
+  bonus, independent of QB style), and two pass-rush-tagged defenders
+  together count as a real pass-rush duo (its own bonus, first time
+  defense factors into the chemistry score at all).
+- **WR auto-sort**: after any WR change, your three receivers re-sort by
+  overall so "WR1" always means "your best receiver," regardless of which
+  slot got replaced.
+- **Rentals tracked by player reference, not array index/slot.** This was
+  needed for WR auto-sort to work safely (an index-based rental would
+  revert the wrong slot after a sort), and it's more robust in general.
+- **Loss pack reworked**: no more rentals -- a season-long Unit Upgrade
+  (+6, smaller than the win-pack version) plus a season-long depth player.
+  Win-pack Unit Upgrade bumped to +10 to stay clearly better.
+- **Fake stat lines** in the ticker for standout performances (grade 4+)
+  when there's an actual named player to credit -- e.g. a QB or RB line
+  after a big Pass/Run Game grade, a defender's line after a big Pass/Run
+  Defense grade. Never fabricated for an unnamed default player.
+- **Fixed: rentals ending early / players vanishing.** Two related root
+  causes: rentals were ticking the instant a pack was confirmed (before
+  any game was played with the new player), and an old rental left
+  tracking an overwritten slot could later fire and revert to a stale
+  snapshot -- wiping out a permanent pickup. Both fixed: `tickRentals`
+  only fires once per week, at the moment a game is simulated
+  (`script.js` `runSim`), and `packs.js` clears any stale rental the
+  instant its player is displaced.
+- **Category-weighted pack picks**, so WR/RB/TE/DEF pulls feel evenly
+  likely regardless of how the tier pools are shaped or how much you've
+  already picked over -- likely the source of the "too many TEs" feeling.
+- **Games-remaining icon** (⏳) on any roster player currently on a rental.
+- **Scheme Fit icon** (✓) on pack cards when a player's tags complement
+  your QB's style.
+- **Opponent scouting report** before kickoff, kept short: team, strength
+  tier, QB, and the scheme matchup read.
+- **Pack spin reveal**: player pulls cycle through same-position
+  candidates before landing on the real pick. Selection is disabled until
+  a card's own spin finishes.
+
+## What's new in v4
 
 - **Fixed: players disappearing / not adding.** Root cause was two related
   bugs: (1) rentals were ticking down the instant you confirmed a pack,
